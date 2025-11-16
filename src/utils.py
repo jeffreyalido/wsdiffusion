@@ -1,10 +1,12 @@
-import torch
-from torchvision import transforms
+from collections import OrderedDict
 
 import numpy as np
+import torch
 from matplotlib.pyplot import imshow
-
 from PIL import Image
+from torchvision import transforms
+
+import wsdiffusion
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -414,7 +416,7 @@ def save_image(image, path):
     image.save(path)
 
 
-def load_jpg_image(path):
+def load_image_from_path(path):
     """
     Load a JPG image from the specified path and convert it to a tensor.
 
@@ -425,5 +427,25 @@ def load_jpg_image(path):
         torch.Tensor: Image tensor of shape (C, H, W).
     """
     image = Image.open(path).convert("RGB")
-    transform = transforms.ToTensor()
+    
+    transform1 = transforms.ToTensor()
+    transform2 = transforms.Lambda(lambda t: normalize_tensor(t))
+    transform = transforms.Compose([transform1, transform2])
+
     return transform(image).unsqueeze(0)  # Add batch dimension
+
+
+def load_model(model_path, n_blocks):
+    model = wsdiffusion.model_arch.UNet(n_blocks=n_blocks)
+    cp = torch.load(model_path)  # uncorrelated
+    model_state_dict = cp["model_state_dict"]
+
+    # rename the keys to remove the "_orig_mod." prefix
+
+    new_state_dict = OrderedDict()
+    for k, v in model_state_dict.items():
+        name = k[10:]  # remove `module.`
+        new_state_dict[name] = v
+
+    model.load_state_dict(new_state_dict)
+    return torch.compile(model)

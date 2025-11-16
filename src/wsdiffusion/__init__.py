@@ -2,11 +2,10 @@ import math
 
 import torch
 
-from src import utils, model_arch
+from src import utils, model_arch, likelihood_models
 
 
-__all__ = ["utils", "model_arch"]
-
+__all__ = ["utils", "model_arch", "likelihood_models"]
 
 class Beta:
     """noise schedule"""
@@ -34,16 +33,6 @@ class Beta:
         return self.calc_R1(t)
 
 
-# def sample_noise(
-#     sizes: tuple | list,
-#     gaussian_noise: str,
-#     gauss_std: tuple = (11, 15),
-#     gauss_std_dist: str = "uniform",
-#     n: float = 0.5,
-#     device: str = "cuda",
-#     c_alpha: float = 0.5,
-#     isotropic: bool = True,
-# ) -> torch.Tensor:
 def sample_noise(
     noise_args: dict,
     device: str = "cuda",
@@ -52,19 +41,20 @@ def sample_noise(
     Sample Gaussian Random Fields (GRFs) with different kernel types.
 
     Args:
-        sizes (): Dimensions of the input tensor (B, C, H, W).
-        kname (str): Type of kernel to use ('gaussian', 'scale_free', 'combined', 'none').
-        gauss_std (tuple, optional): Standard deviation limits for Gaussian kernel. Defaults to (11, 15).
-        length_scale_bounds (tuple, optional): Bounds for length scale in scale-free kernel. Defaults to (0.3, 1).
-        length_scale_dist (str, optional): Distribution type for length scale. Defaults to "uniform".
-        n (float, optional): Split ratio for 'combined' mode. Defaults to 0.5 for half gray, half rgb.
-        device (str, optional): Device to perform computation on. Defaults to "cuda".
+        noise_args = {
+            "sizes": (B, C, H, W),
+            "gaussian_noise_type": "isotropic" or "anisotropic",
+            "std_lims": (min_std, max_std),
+            "gauss_std_dist": "uniform" or "log_uniform",
+            "n": fraction of gray-scale images in case of anisotropic noise,
+            "isotropic": bool, whether to use isotropic kernels
+        }
 
     Returns:
         torch.Tensor: Generated GRF tensor.
     """
     B, C, H, W = noise_args.get("sizes")
-    if noise_args.get("gaussian_noise") == "isotropic":
+    if noise_args.get("gaussian_noise_type") == "rgb_anisotropic":
         z = torch.randn(B, 3, H, W, device=device)
         k = utils.generate_gaussian_kernels(
             B=z.shape[0],
@@ -75,7 +65,7 @@ def sample_noise(
             isotropic=noise_args.get("isotropic"),
         )
         sampled_noise = utils.conv2d(obj=z, kernel=k)
-    elif noise_args.get("gaussian_noise") == "anisotropic":
+    elif noise_args.get("gaussian_noise_type") == "mix_anisotropic":
         B_gray = int(B * noise_args.get("n"))
         B_rgb = B - B_gray
 
@@ -97,6 +87,24 @@ def sample_noise(
         noise = torch.randn_like(z) * c_alpha
 
         sampled_noise = (utils.conv2d(obj=z, kernel=k) + noise) / math.sqrt(1 + c_alpha)
+    elif noise_args.get("gaussian_noise_type") == "gray_anisotropic":
+        z = torch.randn(B, 1, H, W, device=device)
+        z = torch.repeat_interleave(z, 3, dim=1)
+        k = utils.generate_gaussian_kernels(
+            B=z.shape[0],
+            std_lims=(noise_args.get("std_lims")[0], noise_args.get("std_lims")[1]),
+            size=(z.shape[-2], z.shape[-1]),
+            gauss_std_dist=noise_args.get("gauss_std_dist"),
+            device=device,
+            isotropic=noise_args.get("isotropic"),
+        )
+        sampled_noise = utils.conv2d(obj=z, kernel=k)
+    elif noise_args.get("gaussian_noise_type") == "isotropic":
+        sampled_noise = torch.randn(B, C, H, W, device=device)
+    else:
+        raise ValueError(
+            f"Unknown gaussian_noise_type: {noise_args.get('gaussian_noise_type')}"
+        )
 
     return sampled_noise
 
@@ -159,19 +167,104 @@ def VP_GGscore(noise: torch.Tensor, beta: Beta, t: torch.Tensor) -> torch.Tensor
 def add_noise(
     x: torch.tensor,
     t: float,
-    gauss_kname: str,
-    gauss_std: float = 2,
-    isotropic: bool = True,
+    noise_args: dict,
     beta: Beta = Beta(),
+    device: str = "cuda",
 ):
-    device = x.device
+    if not noise_args:
+        noise_args = {
+            "sizes": x.size(),
+            "gaussian_noise_type": "isotropic",
+            "std_lims": (0.1, 0.1),
+            "gauss_std_dist": "uniform",
+            "isotropic": True,
+        }
     noise = sample_noise(
-        sizes=x.size(),
-        kname=gauss_kname,
-        gauss_std=(gauss_std, gauss_std),
+        noise_args=noise_args,
         device=device,
-        isotropic=isotropic,
     )
+
     t = torch.tensor([t]).to(device)  # Start time
 
     return forward_sampling_VP(x, noise, t, beta)
+
+
+def solve_inv_ODE(
+    model: torch.nn.Module,
+    y: torch.tensor,
+    A: callable,
+    lambd: float,
+    likelihood: str = "jalal",
+    beta: Beta = Beta(),
+    device: str = "cuda",
+    noise_args: dict = None,
+):
+    """_summary_
+
+    Args:
+        model (torch.nn.Module): trained ws-diffusion model prior
+        y (torch.tensor): noisy measurement
+        A (callable): likelihood forward operator
+        lambd (float): regularization parameter for the inverse problem
+        likelihood (str, optional): likelihood model to use. Defaults to "jalal".
+        beta (Beta, optional): Beta schedule for the diffusion process. Defaults to Beta().
+        device (str, optional): device to run the computation on. Defaults to "cuda".
+        noise_args (dict, optional): additional arguments for noise sampling. Defaults to None.
+
+    Returns:
+        _type_: x_hat, the reconstructed image
+    """
+    T = 1000
+    if not noise_args:
+        noise_args = {
+            "sizes": y.size(),
+            "gaussian_noise_type": "isotropic",
+            "std_lims": (1.0, 1.0),
+            "gauss_std_dist": "uniform",
+            "isotropic": True,
+        }
+    x = sample_noise(
+        noise_args=noise_args,
+        device=device,
+    )
+    x.requires_grad = True
+    t_array = torch.linspace(1001 - T, 1000, T).to(device)  # Start time
+    t_array = (t_array.int()) / 1000
+    for _, t in enumerate(reversed(t_array)):
+        with torch.no_grad():
+            ggscore = model(x, torch.tensor([t], device=device))
+
+        if likelihood == "jalal":
+            log_likelihood = torch.norm(y - A(x), 2)
+            x_prime = (
+                (2 - torch.sqrt(1 - beta(t) / 1000)) * x
+                + ggscore
+                / 1000
+                / 2 
+            )
+            meas_match = torch.autograd.grad(outputs=log_likelihood, inputs=x)[0]
+            ggscore_mag = torch.norm(ggscore, 2)
+            meas_match_mag = torch.norm(meas_match, 2)
+            meas_match /= meas_match_mag
+            scalar = lambd * ggscore_mag
+            meas_match *= scalar
+            x = x_prime - meas_match / 1000 / 2
+        elif likelihood == "dps":
+            x_hat = ggscore * (1 - beta.calc_R2(t)) / beta(t) + x
+            log_likelihood = torch.norm(y - A(x_hat), 2)
+            x_prime = (2 - torch.sqrt(1 - beta(t) / 1000)) * x + ggscore / 1000 / 2
+            meas_match = torch.autograd.grad(outputs=log_likelihood, inputs=x)[0]
+            ggscore_mag = torch.norm(ggscore, 2)
+            meas_match /= torch.norm(meas_match, 2)
+            scalar = lambd * ggscore_mag
+            meas_match *= scalar
+            x = x_prime - meas_match / 1000 / 2
+
+    # tweedie's formula
+    with torch.no_grad():
+        x = (
+            model(x, torch.tensor([t], device=device)) * (1 - beta.calc_R2(t)) / beta(t)
+            + x
+        )
+
+    return x
