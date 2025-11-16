@@ -50,6 +50,16 @@ The provided code in this repo is very minimal and raw for ease of hacking and e
 uv run train.py
 ```
 
+### Open Weights
+Weights for the trained WS-DMs may be found on https://huggingface.co/jeffreyalido.
+
+### Sampling and Inference
+You may define your likelihood model in `src/likelihood_models.py`. A sample script for deblurring is in deblur.py. To run it, use:
+```bash
+uv run deblur.py
+```
+---
+
 If you use this work in your research, please cite the accompanying paper:
 
 ```bibtex
