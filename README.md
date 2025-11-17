@@ -13,7 +13,7 @@ Whitened Score Diffusion (WS‑DM) is a generalization of score‑based diffusio
 
 1. **Clone the repository:**
 ```bash
-   git clone https://github.com/yourusername/wsdiffusion.git
+   git clone https://github.com/jeffreyalido/wsdiffusion.git
    cd wsdiffusion
 ```
 
